@@ -285,26 +285,29 @@ def stop_running():
 # Synthesis + streaming playback
 # ---------------------------------------------------------------------------
 
-def player_cmd(rate):
+def player_cmd(rate, volume=None):
     if shutil.which("pw-play"):
-        return ["pw-play", "--raw", "--format", "s16", "--rate", str(rate),
-                "--channels", "1", "-"]
+        cmd = ["pw-play", "--raw", "--format", "s16", "--rate", str(rate), "--channels", "1"]
+        if volume is not None:
+            cmd += ["--volume", f"{volume}"]
+        return cmd + ["-"]
     if shutil.which("aplay"):
         return ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-c", "1", "-r", str(rate), "-"]
     if shutil.which("ffplay"):
-        return ["ffplay", "-hide_banner", "-loglevel", "quiet", "-nodisp",
-                "-autoexit", "-f", "s16le", "-ar", str(rate), "-ch_layout", "mono", "-i", "-"]
+        vol = ["-volume", str(int(max(0.0, min(2.0, volume if volume is not None else 1.0)) * 100))]
+        return ["ffplay", "-hide_banner", "-loglevel", "quiet", "-nodisp", "-autoexit",
+                *vol, "-f", "s16le", "-ar", str(rate), "-ch_layout", "mono", "-i", "-"]
     return None
 
 
-def speak(text, voice, length_scale):
+def speak(text, voice, length_scale, sentence_silence=0.2, volume=None):
     voices = discover_voices()
     vid = pick_voice(voices, voice)
     if not vid:
         sys.exit("no voices found in " + VOICES_DIR)
     info = voices[vid]
 
-    player = player_cmd(info["rate"])
+    player = player_cmd(info["rate"], volume)
     if not player:
         sys.exit("no audio player found (need pw-play, aplay or ffplay)")
 
@@ -328,7 +331,8 @@ def speak(text, voice, length_scale):
     piper = subprocess.Popen(
         [PIPER_BIN, "-m", info["model"], "-c", info["config"],
          "--espeak_data", ESPEAK_DATA, "--output_raw", "-q",
-         "--length_scale", f"{length_scale}"],
+         "--length_scale", f"{length_scale}",
+         "--sentence_silence", f"{sentence_silence}"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL, env=env,
     )
@@ -404,12 +408,23 @@ def main():
         print(f"default voice -> {args.set_voice}")
         return
 
+    def clamp(v, lo, hi):
+        try:
+            return max(lo, min(hi, float(v)))
+        except (TypeError, ValueError):
+            return None
+
+    volume = clamp(cfg.get("volume"), 0.0, 2.0)
+    sentence_silence = clamp(cfg.get("sentence_silence"), 0.0, 2.0)
+    if sentence_silence is None:
+        sentence_silence = 0.2
+
     if args.set_speed is not None or args.faster or args.slower:
         new = adjust_speed(cfg, set_to=args.set_speed,
                            delta=(0.1 if args.faster else 0.0) - (0.1 if args.slower else 0.0))
         ls = max(0.3, min(3.0, 1.0 / new))
         stop_running()  # don't overlap any current read
-        speak(f"speed {new:.1f}", voice, ls)  # short spoken confirmation
+        speak(f"speed {new:.1f}", voice, ls, sentence_silence, volume)  # spoken confirmation
         return
 
     speed = args.speed or cfg.get("speed") or 1.0
@@ -418,7 +433,7 @@ def main():
     if args.text is not None:
         text = prepare_text(args.text)
         if text:
-            speak(text, voice, length_scale)
+            speak(text, voice, length_scale, sentence_silence, volume)
         return
 
     # default action: toggle. If something is speaking, stop it; else read.
@@ -427,7 +442,7 @@ def main():
     text = prepare_text(get_selection())
     if not text:
         return
-    speak(text, voice, length_scale)
+    speak(text, voice, length_scale, sentence_silence, volume)
 
 
 if __name__ == "__main__":
