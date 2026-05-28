@@ -1,0 +1,22 @@
+# --- Piper engine + voice models (download separately) ---
+# These are large prebuilt/binary artifacts. The voice models exceed
+# GitHub's 100 MB file limit and would be rejected on push.
+/piper/
+/voices/
+piper_*.tar.gz
+*.onnx
+*.onnx.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- Local tooling / editor / OS ---
+.claude/settings.local.json
+.vscode/
+.idea/
+*.swp
+.DS_Store
