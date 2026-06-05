@@ -371,7 +371,7 @@ def adjust_speed(cfg, set_to=None, delta=0.0):
     cur = float(cfg.get("speed", 1.0))
     if set_to is not None:
         cur = set_to
-    cur = max(0.5, min(2.5, round(cur + delta, 2)))
+    cur = max(0.5, min(5.0, round(cur + delta, 2)))
     cfg["speed"] = cur
     save_config(cfg)
     return cur
@@ -422,13 +422,13 @@ def main():
     if args.set_speed is not None or args.faster or args.slower:
         new = adjust_speed(cfg, set_to=args.set_speed,
                            delta=(0.1 if args.faster else 0.0) - (0.1 if args.slower else 0.0))
-        ls = max(0.3, min(3.0, 1.0 / new))
+        ls = max(0.2, min(3.0, 1.0 /new))
         stop_running()  # don't overlap any current read
         speak(f"speed {new:.1f}", voice, ls, sentence_silence, volume)  # spoken confirmation
         return
 
     speed = args.speed or cfg.get("speed") or 1.0
-    length_scale = max(0.3, min(3.0, 1.0 / speed))
+    length_scale = max(0.2, min(3.0, 1.0 /speed))
 
     if args.text is not None:
         text = prepare_text(args.text)

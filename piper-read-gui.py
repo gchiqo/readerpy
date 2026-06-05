@@ -99,9 +99,9 @@ class Window(Gtk.ApplicationWindow):
 
         # Speed
         grid.attach(self._lbl("Speed"), 0, r, 1, 1)
-        self.speed = self._scale(0.5, 2.5, 0.1, 1)
+        self.speed = self._scale(0.5, 5.0, 0.1, 1)
         self.speed.set_value(float(self.cfg["speed"]))
-        for m in (0.5, 1.0, 1.5, 2.0, 2.5):
+        for m in (1.0, 2.0, 3.0, 4.0, 5.0):
             self.speed.add_mark(m, Gtk.PositionType.BOTTOM, None)
         self.speed.connect("value-changed", self.on_change)
         grid.attach(self.speed, 1, r, 2, 1)
