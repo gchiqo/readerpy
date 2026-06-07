@@ -358,11 +358,29 @@ def speak(text, voice, length_scale, sentence_silence=0.2, volume=None):
 # ---------------------------------------------------------------------------
 
 def get_selection():
-    import gi
-    gi.require_version("Gtk", "3.0")
-    from gi.repository import Gtk, Gdk
-    clip = Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY)
-    return clip.wait_for_text() or ""
+    """Return the current PRIMARY selection.
+
+    Wayland (GNOME on Wayland) doesn't expose the X11 PRIMARY selection to
+    GTK in a way we can grab from a non-Wayland-native app, so on a Wayland
+    session we shell out to `wl-paste --primary`. On X11 we use GTK.
+    """
+    if os.environ.get("WAYLAND_DISPLAY"):
+        try:
+            r = subprocess.run(
+                ["wl-paste", "--primary", "--no-newline"],
+                capture_output=True, timeout=2,
+            )
+            return r.stdout.decode("utf-8", "replace")
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return ""
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk, Gdk
+        clip = Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY)
+        return clip.wait_for_text() or ""
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
