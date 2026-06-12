@@ -77,9 +77,9 @@ class Window(Gtk.ApplicationWindow):
         title.set_markup("<b>Piper Read Aloud</b>")
         grid.attach(title, 0, r, 3, 1)
         r += 1
-        hint = Gtk.Label(xalign=0)
-        hint.set_markup("<small>Select text anywhere and press the shortcut to read it.</small>")
-        grid.attach(hint, 0, r, 3, 1)
+        self.indicator = Gtk.Label(xalign=0)
+        self.indicator.set_markup("<span foreground='#888'>●</span>  Checking…")
+        grid.attach(self.indicator, 0, r, 3, 1)
         r += 1
 
         # Voice
@@ -124,15 +124,24 @@ class Window(Gtk.ApplicationWindow):
         grid.attach(self.pause, 1, r, 2, 1)
         r += 1
 
-        # Action buttons
+        # Big primary action: read whatever is currently selected.
+        # This is the reliable path when the global hotkey gets eaten by focus
+        # changes or when the active layout doesn't map the shortcut.
+        b_read = Gtk.Button(label="▶  Read selection")
+        b_read.get_style_context().add_class("suggested-action")
+        b_read.set_size_request(-1, 42)
+        b_read.connect("clicked", lambda *_: run_reader())
+        grid.attach(b_read, 0, r, 3, 1)
+        r += 1
+
+        # Secondary row
         btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, homogeneous=True)
         b_test = Gtk.Button(label="Test voice")
-        b_read = Gtk.Button(label="Read selection")
-        b_stop = Gtk.Button(label="Stop")
+        b_stop = Gtk.Button(label="⏹  Stop")
         b_test.connect("clicked", self.on_test)
-        b_read.connect("clicked", lambda *_: run_reader())
         b_stop.connect("clicked", lambda *_: run_reader("--stop"))
-        for b in (b_test, b_read, b_stop):
+        b_stop.get_style_context().add_class("destructive-action")
+        for b in (b_test, b_stop):
             btns.pack_start(b, True, True, 0)
         grid.attach(btns, 0, r, 3, 1)
         r += 1
@@ -160,6 +169,10 @@ class Window(Gtk.ApplicationWindow):
         self._loading = False
         self.show_all()
 
+        # live status indicator: poll once and then every second
+        self._update_indicator()
+        GLib.timeout_add_seconds(1, self._update_indicator)
+
     # -- widget helpers --
     def _lbl(self, text):
         lbl = Gtk.Label(label=text, xalign=0)
@@ -175,6 +188,44 @@ class Window(Gtk.ApplicationWindow):
     def _flash(self, text, error=False):
         color = "#c0392b" if error else "#2e7d32"
         self.status.set_markup(f"<small><span foreground='{color}'>{GLib.markup_escape_text(text)}</span></small>")
+
+    # -- live status indicator --
+    def _hotkey_bound(self):
+        entry = ("org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:"
+                 "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/piper-read/")
+        try:
+            out = subprocess.check_output(
+                ["gsettings", "get", entry, "binding"],
+                text=True, timeout=2,
+            ).strip().strip("'\"")
+            return out if out and out != "''" else None
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return None
+
+    def _is_reading(self):
+        lock = os.path.expanduser("~/.cache/piper-read/play.pgid")
+        try:
+            with open(lock) as fh:
+                pgid = int(fh.read().strip())
+            os.killpg(pgid, 0)
+            return True
+        except (OSError, ValueError, ProcessLookupError, PermissionError):
+            return False
+
+    def _update_indicator(self):
+        if self._is_reading():
+            color, txt = "#2ecc71", "Reading… (press Stop or the shortcut to interrupt)"
+        else:
+            bound = self._hotkey_bound()
+            if bound:
+                pretty = bound.replace("<", "").replace(">", "+").rstrip("+").replace("+", " + ")
+                color, txt = "#2ecc71", f"Ready  ·  hotkey: {pretty}"
+            else:
+                color, txt = "#e74c3c", "Hotkey not bound — use Read selection button or Apply the shortcut below"
+        self.indicator.set_markup(
+            f"<span foreground='{color}'>●</span>  {GLib.markup_escape_text(txt)}"
+        )
+        return True  # keep firing
 
     # -- handlers --
     def on_change(self, *_):
