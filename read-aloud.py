@@ -460,6 +460,25 @@ def main():
     text = prepare_text(get_selection())
     if not text:
         return
+
+    if cfg.get("reading_mode"):
+        overlay = os.path.join(HERE, "reader_overlay.py")
+        if os.path.exists(overlay):
+            cmd = ["python3", overlay,
+                   "--speed", str(speed),
+                   "--pause", str(sentence_silence)]
+            if voice:
+                cmd += ["--voice", voice]
+            if volume is not None:
+                cmd += ["--volume", str(volume)]
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+            try:
+                proc.stdin.write(text.encode("utf-8"))
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+            return
+
     speak(text, voice, length_scale, sentence_silence, volume)
 
 

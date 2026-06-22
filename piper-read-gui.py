@@ -25,6 +25,7 @@ DEFAULTS = {
     "speed": 1.0,
     "volume": 1.0,
     "sentence_silence": 0.2,
+    "reading_mode": False,
     "hotkey": "<Super><Shift>a",
 }
 
@@ -122,6 +123,15 @@ class Window(Gtk.ApplicationWindow):
         self.pause.set_value(float(self.cfg["sentence_silence"]))
         self.pause.connect("value-changed", self.on_change)
         grid.attach(self.pause, 1, r, 2, 1)
+        r += 1
+
+        # Reading-mode toggle: fullscreen overlay with word highlight
+        self.reading_mode = Gtk.CheckButton(
+            label="Reading mode — fullscreen overlay, words highlight as they're read"
+        )
+        self.reading_mode.set_active(bool(self.cfg.get("reading_mode", False)))
+        self.reading_mode.connect("toggled", self.on_change)
+        grid.attach(self.reading_mode, 0, r, 3, 1)
         r += 1
 
         # Big primary action: read whatever is currently selected.
@@ -235,6 +245,7 @@ class Window(Gtk.ApplicationWindow):
         self.cfg["speed"] = round(self.speed.get_value(), 2)
         self.cfg["volume"] = round(self.volume.get_value() / 100.0, 2)
         self.cfg["sentence_silence"] = round(self.pause.get_value(), 2)
+        self.cfg["reading_mode"] = self.reading_mode.get_active()
         save_config(self.cfg)
         self._flash("Saved")
 
