@@ -56,34 +56,47 @@ EMAIL_RE = re.compile(r"\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
 RULE_RE = re.compile(r"[=_*~`#>|^]{2,}")
 DASHES_RE = re.compile(r"-{2,}")
 TOKEN_RE = re.compile(r"\S+")
-SYMBOL_BAD_RE = re.compile(r"[^A-Za-z0-9'.,!?;:%$\u00C0-\u024F-]")
 CODEY_RE = re.compile(r"[_(){}\[\]<>/\\=+*&|^~`@#]|::|->|=>")
+KEEP_PUNCT = set("'.,!?;:%$-")
+
+
+def _has_letter_or_digit(s):
+    return any(c.isalpha() or c.isdigit() for c in s)
 
 
 def clean_token(tok):
-    alnum = re.sub(r"[^A-Za-z0-9]", "", tok)
-    if len(alnum) >= 15 and re.search(r"[0-9]", alnum) and re.search(r"[A-Za-z]", alnum):
-        return ""  # hash / id / base64
+    # Long alnum mash (hash / id / base64) \u2014 Latin-specific by design; a
+    # Georgian/Cyrillic block wouldn't match either regex.
+    ascii_alnum = re.sub(r"[^A-Za-z0-9]", "", tok)
+    if len(ascii_alnum) >= 15 and re.search(r"[0-9]", ascii_alnum) and re.search(r"[A-Za-z]", ascii_alnum):
+        return ""
     if re.match(r"^[A-Za-z0-9_\-]{30,}$", tok):
         return ""
 
-    symbol_count = len(SYMBOL_BAD_RE.findall(tok))
+    # Count "bad" chars: anything that isn't a Unicode letter/digit or an
+    # allowed punctuation mark. Georgian/Cyrillic/CJK letters count as
+    # letters here, so they no longer trip is_codey.
+    symbol_count = sum(
+        1 for c in tok
+        if not (c.isalpha() or c.isdigit()) and c not in KEEP_PUNCT
+    )
     is_codey = (
         bool(CODEY_RE.search(tok))
-        or bool(re.search(r"[a-z][A-Z]", tok))
-        or bool(re.search(r"[A-Z]{2,}[a-z]", tok))
+        or bool(re.search(r"[a-z][A-Z]", tok))          # camelCase
+        or bool(re.search(r"[A-Z]{2,}[a-z]", tok))      # HTMLParser
         or symbol_count >= 2
     )
     if not is_codey:
         return tok
 
-    t = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", tok)       # camelCase
-    t = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", t)      # HTMLParser -> HTML Parser
+    t = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", tok)
+    t = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", t)
     t = re.sub(r"_+", " ", t)
     t = re.sub(r"\.", " ", t)
-    t = re.sub(r"[^A-Za-z0-9 \u00C0-\u024F]+", " ", t)
+    # Strip anything that's not a letter (ANY script), digit, or space.
+    t = "".join(c if (c.isalpha() or c.isdigit() or c.isspace()) else " " for c in t)
     t = re.sub(r"\s+", " ", t).strip()
-    if not re.search(r"[A-Za-z0-9]", t):
+    if not _has_letter_or_digit(t):
         return ""
     if re.match(r"^[A-Za-z0-9]{25,}$", re.sub(r"\s", "", t)):
         return ""
@@ -109,7 +122,7 @@ def clean_for_speech(s):
     s = re.sub(r"\s*/\s*", " ", s)
     s = re.sub(r"(^|\s)[!?;:,.]+(?=\s|$)", r"\1", s)  # space-isolated punctuation
     s = re.sub(r"\s+", " ", s).strip()
-    if not re.search(r"[A-Za-z0-9\u00C0-\u024F]", s):
+    if not _has_letter_or_digit(s):
         return ""
     return s
 
