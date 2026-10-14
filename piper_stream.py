@@ -27,6 +27,7 @@ All three are tunable in ~/.config/piper-read/config.json:
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -46,12 +47,61 @@ PAD = 0.05        # size of each silence pad
 
 
 def _tunable(key, fallback, lo=0.0, hi=2.0):
+    value = _config().get(key)
+    try:
+        return fallback if value is None else max(lo, min(hi, float(value)))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _config():
     try:
         with open(CONFIG) as fh:
-            value = json.load(fh).get(key)
-        return fallback if value is None else max(lo, min(hi, float(value)))
-    except (OSError, ValueError, TypeError, AttributeError):
-        return fallback
+            cfg = json.load(fh)
+        return cfg if isinstance(cfg, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+# Georgian: Mkhedruli / Asomtavruli / Mtavruli plus the Extended block.
+_GEORGIAN_RE = re.compile(r"[Ⴀ-ჿᲐ-Ჿ]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
+
+
+def is_georgian(text):
+    """True when the text is mostly Georgian letters. A strict majority, so a
+    lone Georgian name in an English line stays on the English voice (which
+    mangles one word) rather than the Georgian one (which would mangle all the
+    English)."""
+    ka = len(_GEORGIAN_RE.findall(text))
+    return ka > 0 and ka > len(_LATIN_RE.findall(text))
+
+
+def voice_runs(lines, voices, default_vid):
+    """Group consecutive lines by the voice that should read them:
+    [(voice_info, [lines...]), ...]. Georgian lines go to the Georgian voice
+    (config "voice_georgian", else the first ka_ voice) unless "auto_language"
+    is false in the config. Decided per line, so a mixed selection reads each
+    line in the right voice."""
+    cfg = _config()
+    default = voices[default_vid]
+    ka_vid = None
+    if cfg.get("auto_language", True):
+        ka_vid = cfg.get("voice_georgian") or ""
+        if ka_vid not in voices:
+            ka_vid = next((v for v in voices if v.startswith(("ka_", "ka-"))), None)
+    # One output stream, one sample rate: skip a voice that doesn't match.
+    if ka_vid and voices[ka_vid]["rate"] != default["rate"]:
+        ka_vid = None
+
+    runs = []
+    for line in lines:
+        info = voices[ka_vid] if ka_vid and is_georgian(line) else default
+        if runs and runs[-1][0] is info:
+            runs[-1][1].append(line)
+        else:
+            runs.append((info, [line]))
+    return runs
 
 
 def piper_env():

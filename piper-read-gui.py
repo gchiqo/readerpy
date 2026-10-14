@@ -26,6 +26,7 @@ DEFAULTS = {
     "volume": 1.0,
     "sentence_silence": 0.2,
     "reading_mode": False,
+    "auto_language": True,
     "hotkey": "<Super><Shift>a",
 }
 
@@ -158,6 +159,15 @@ class Window(Gtk.ApplicationWindow):
         grid.attach(self.reading_mode, 0, r, 3, 1)
         r += 1
 
+        # Per-line language detection: Georgian lines get the Georgian voice.
+        self.auto_language = Gtk.CheckButton(
+            label="Read Georgian text with the Georgian voice (auto-detect)"
+        )
+        self.auto_language.set_active(bool(self.cfg.get("auto_language", True)))
+        self.auto_language.connect("toggled", self.on_change)
+        grid.attach(self.auto_language, 0, r, 3, 1)
+        r += 1
+
         # Big primary action: read whatever is currently selected.
         # This is the reliable path when the global hotkey gets eaten by focus
         # changes or when the active layout doesn't map the shortcut.
@@ -277,6 +287,7 @@ class Window(Gtk.ApplicationWindow):
         self.cfg["volume"] = round(self.volume.get_value() / 100.0, 2)
         self.cfg["sentence_silence"] = round(self.pause.get_value(), 2)
         self.cfg["reading_mode"] = self.reading_mode.get_active()
+        self.cfg["auto_language"] = self.auto_language.get_active()
         save_config(self.cfg)
         self._flash("Saved")
 

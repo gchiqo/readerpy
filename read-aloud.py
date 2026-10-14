@@ -59,6 +59,31 @@ TOKEN_RE = re.compile(r"\S+")
 CODEY_RE = re.compile(r"[_(){}\[\]<>/\\=+*&|^~`@#]|::|->|=>")
 KEEP_PUNCT = set("'.,!?;:%$-")
 
+# Separators inside dotted / colon-joined identifiers (CLAUDE.md, .env,
+# config.v2, key:value) become a space. Left as-is they derail espeak's
+# phonemiser and the whole utterance garbles. Decimals (3.14), digit:digit
+# times/ratios (3:30) and sentence periods followed by a space are untouched.
+_DOT_BETWEEN_WORDS = re.compile(r"(?<=[A-Za-z])\.(?=[A-Za-z0-9])")  # a.b, file.ext
+_LEADING_DOT = re.compile(r"(?<!\S)\.(?=[A-Za-z])")                 # .env
+_COLON_ID = re.compile(r"(?<=[A-Za-z]):(?=\w)|(?<=\w):(?=[A-Za-z])")
+
+
+def normalize_identifiers(s):
+    s = _DOT_BETWEEN_WORDS.sub(" ", s)
+    s = _LEADING_DOT.sub(" ", s)
+    s = _COLON_ID.sub(" ", s)
+    return s
+
+
+def strip_pictographs(s):
+    """Emoji, dingbats and other pictographs (Unicode category So) -> space.
+
+    espeak reads them by their Unicode names ("party popper", "white heavy
+    check mark"), which is just noise. Currency (€ £) and math (∞ →) are
+    read sensibly by espeak here, so those are kept.
+    """
+    return "".join(" " if unicodedata.category(c) == "So" else c for c in s)
+
 
 def _has_letter_or_digit(s):
     return any(c.isalpha() or c.isdigit() for c in s)
@@ -108,12 +133,16 @@ def clean_for_speech(s):
         return ""
     s = unicodedata.normalize("NFKC", s)
     s = CTRL_RE.sub("", s)
+    s = strip_pictographs(s)
     s = URL_RE.sub(" ", s)
     s = WWW_RE.sub(" ", s)
     s = EMAIL_RE.sub(
         lambda m: re.sub(r"[._%+-]", " ", m.group(1)) + " at " + re.sub(r"\.", " dot ", m.group(2)),
         s,
     )
+    s = re.sub(r"\be\.g\.", "for example", s, flags=re.I)
+    s = re.sub(r"\bi\.e\.", "that is", s, flags=re.I)
+    s = normalize_identifiers(s)  # after URLs/emails so those aren't broken first
     s = RULE_RE.sub(" ", s)
     s = DASHES_RE.sub(" ", s)
     s = TOKEN_RE.sub(lambda m: clean_token(m.group(0)), s)
@@ -173,6 +202,44 @@ def split_sentences(text):
     return out
 
 
+# Clause boundaries. The cleaner strips most of these marks, so without a
+# split the clauses reach Piper glued into one run-on utterance, and dense
+# run-ons (identifiers, emails, acronyms) collapse into "bla bla" mid-way,
+# even fairly short ones (verified by transcribing Piper's output). Splits:
+# after ':' or ';', around a parenthetical, at ', ' (so 1,000 stays intact),
+# at any em/en dash, and at a spaced hyphen.
+CLAUSE_RE = re.compile(
+    r"(?<=[:;])\s+|\s+(?=[(\[])|(?<=[)\]])\s+|,\s+|\s*[\u2012-\u2015]+\s*|\s+-+\s+"
+)
+
+
+def split_clauses(sent):
+    return [p.strip() for p in CLAUSE_RE.split(sent) if p.strip()] or [sent]
+
+
+# What garbles Piper is a dense utterance, not merely a long one. So after
+# splitting at every clause boundary, adjacent clauses are greedily repacked
+# (rejoined with commas, so the pauses stay) up to this many characters:
+# ordinary comma-rich prose becomes one or two natural utterances, while dense
+# clauses are long enough that they stay separate.
+PACK_LIMIT = 90
+
+
+def pack_clauses(clauses):
+    out, cur = [], ""
+    for clause in clauses:
+        if not cur:
+            cur = clause
+        elif len(cur) + 2 + len(clause) <= PACK_LIMIT:
+            cur = cur.rstrip(",;:") + ", " + clause
+        else:
+            out.append(cur)
+            cur = clause
+    if cur:
+        out.append(cur)
+    return out
+
+
 def break_long(s, max_len):
     s = s.strip()
     if len(s) <= max_len:
@@ -180,9 +247,13 @@ def break_long(s, max_len):
     out = []
     while len(s) > max_len:
         window = s[:max_len]
+        # Prefer the last comma-ish break in the back half, else the last space.
         cut = -1
-        for m in re.finditer(r"[,;:)\]]\s|\s", window):
-            cut = m.end()
+        for m in re.finditer(r"[,;:)\]]\s", window):
+            if m.end() > max_len // 2:
+                cut = m.end()
+        if cut <= 0:
+            cut = window.rfind(" ") + 1
         if cut <= 0:
             cut = max_len
         piece = s[:cut].strip()
@@ -196,18 +267,20 @@ def break_long(s, max_len):
 
 
 def prepare_text(raw):
-    """Split raw text into bounded, sentence-sized chunks, clean each, and
-    return them newline-joined (one Piper utterance per line)."""
+    """Split raw text into bounded, clause-sized chunks, clean each, and
+    return them newline-joined (one Piper utterance per line).
+
+    Clauses are cleaned before packing so the pack limit sees the length Piper
+    actually gets (info@x.ge expands to "info at x dot ge")."""
     lines = []
     for block in re.split(r"\n+", raw):
         block = block.strip()
         if not block:
             continue
         for sent in split_sentences(block):
-            for chunk in break_long(sent, MAX_CHUNK):
-                spoken = clean_for_speech(chunk)
-                if spoken:
-                    lines.append(spoken)
+            clauses = [c for c in map(clean_for_speech, split_clauses(sent)) if c]
+            for utterance in pack_clauses(clauses):
+                lines.extend(break_long(utterance, MAX_CHUNK))
     return "\n".join(lines)
 
 
@@ -324,6 +397,17 @@ def speak(text, voice, length_scale, sentence_silence=0.2, volume=None):
     # Open the player first so a Bluetooth sink wakes on lead-in silence while
     # Piper is still loading its model.
     player = piper_stream.Player(info["rate"], volume)
+    lines = [ln for ln in text.split("\n") if ln.strip()]
+    for run_info, run_lines in piper_stream.voice_runs(lines, voices, vid):
+        if player.dead:
+            break
+        _stream_piper(player, run_info, "\n".join(run_lines), length_scale, sentence_silence)
+    player.finish()
+    remove_lock()
+
+
+def _stream_piper(player, info, text, length_scale, sentence_silence):
+    """Synthesise `text` with one Piper process and stream it into `player`."""
     piper = subprocess.Popen(
         piper_stream.piper_cmd(info, length_scale, sentence_silence, "--output_raw"),
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -362,12 +446,10 @@ def speak(text, voice, length_scale, sentence_silence=0.2, volume=None):
         odd, data = (data[-1:], data[:-1]) if len(data) % 2 else (b"", data)
         player.write(data)
 
-    player.finish()
     try:
         piper.wait(timeout=2)
     except subprocess.TimeoutExpired:
         piper.kill()
-    remove_lock()
 
 
 # ---------------------------------------------------------------------------

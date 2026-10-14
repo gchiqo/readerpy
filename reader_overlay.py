@@ -119,7 +119,7 @@ class Overlay(Gtk.Window):
     COLOR_CURRENT = "#ffd54f"
     FONT_BIG = "Sans 32"
 
-    def __init__(self, text, voice_info, length_scale, sentence_silence, volume, tmpdir):
+    def __init__(self, text, voices, vid, length_scale, sentence_silence, volume, tmpdir):
         # Normal top-level window so Alt+Tab can find it. Undecorated because
         # we draw our own close button. set_keep_above is best-effort: works
         # on X11, may be ignored on Wayland (the WM controls stacking there).
@@ -235,7 +235,8 @@ class Overlay(Gtk.Window):
         self.text = text
         self.lines = [ln for ln in text.split("\n") if ln.strip()]
         self.words = text.split()
-        self.voice_info = voice_info
+        self.voices = voices
+        self.vid = vid
         self.length_scale = length_scale
         self.sentence_silence = sentence_silence
         self.volume = volume
@@ -245,6 +246,7 @@ class Overlay(Gtk.Window):
         self.piper = None
         self.stopped = False
         self.failed = False
+        self.played = False
         # (start, end) per word in stream seconds; None until its line is
         # synthesised. Filled by the feeder thread, read by _tick.
         self.timings = [None] * len(self.words)
@@ -371,7 +373,7 @@ class Overlay(Gtk.Window):
         try:
             # Opened now so a Bluetooth sink wakes on the lead-in silence
             # while Piper loads its model.
-            self.player = piper_stream.Player(self.voice_info["rate"], self.volume)
+            self.player = piper_stream.Player(self.voices[self.vid]["rate"], self.volume)
         except (RuntimeError, OSError):
             self._show_failure()
             return
@@ -379,67 +381,85 @@ class Overlay(Gtk.Window):
         GLib.timeout_add(40, self._tick)
 
     def _synth_and_play(self):
+        """Lines are grouped by voice (Georgian lines get the Georgian voice);
+        each group is synthesised by one Piper process and fed to the player."""
+        word = 0
+        for info, lines in piper_stream.voice_runs(self.lines, self.voices, self.vid):
+            word = self._play_run(info, lines, word)
+            if word is None:
+                return  # stopped
+
+        if not self.played:
+            self.failed = True
+        self.audio_end = self.player.offset()
+        self.player.finish()
+
+    def _play_run(self, info, lines, word):
         """One Piper process writes each line to its own WAV and prints the
         path when it is done. Each line is queued to the player as soon as it
-        arrives; while waiting on Piper, the player is padded with silence."""
+        arrives; while waiting on Piper, the player is padded with silence.
+        Returns the index of the next word, or None if we were stopped."""
         player = self.player
-        paths = [os.path.join(self.tmpdir, f"{k:05d}.wav") for k in range(len(self.lines))]
+        paths = [os.path.join(self.tmpdir, f"{word:05d}-{k:05d}.wav") for k in range(len(lines))]
         self.piper = subprocess.Popen(
-            piper_stream.piper_cmd(self.voice_info, self.length_scale, self.sentence_silence,
+            piper_stream.piper_cmd(info, self.length_scale, self.sentence_silence,
                                    "--json-input", "--output_dir", self.tmpdir),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, env=piper_stream.piper_env(),
         )
+        piper = self.piper
 
         def feed():
             try:
-                for line, path in zip(self.lines, paths):
-                    self.piper.stdin.write(
+                for line, path in zip(lines, paths):
+                    piper.stdin.write(
                         (json.dumps({"text": line, "output_file": path}) + "\n").encode("utf-8"))
-                self.piper.stdin.close()
+                piper.stdin.close()
             except (BrokenPipeError, OSError, ValueError):
                 pass
 
         done = queue.Queue()
 
         def pull():
-            for _ in self.piper.stdout:  # Piper prints each finished path, in order
+            for _ in piper.stdout:  # Piper prints each finished path, in order
                 done.put(True)
             done.put(False)
 
         threading.Thread(target=feed, daemon=True).start()
         threading.Thread(target=pull, daemon=True).start()
 
-        word = 0
-        for line, path in zip(self.lines, paths):
-            while True:
+        ok = True
+        for line, path in zip(lines, paths):
+            n = len(line.split())
+            while ok:
                 if self.stopped or player.dead:
-                    return
+                    return None
                 try:
                     ok = done.get(timeout=0.02)
                     break
                 except queue.Empty:
                     player.keep_fed()
-            if not ok:
-                break  # Piper exited early
+            if not ok:  # Piper exited early: skip the rest of this run
+                word += n
+                continue
             try:
                 with wave.open(path, "rb") as w:
                     pcm = w.readframes(w.getnframes())
                 os.unlink(path)
             except (OSError, wave.Error, EOFError):
                 pcm = b""
-            n = len(line.split())
             start = player.offset()
             dur = len(pcm) / float(player.bytes_per_sec)
             for i, (s, e) in enumerate(word_timings(self.words[word:word + n], dur)):
                 self.timings[word + i] = (start + s, start + e)
             word += n
             player.write(pcm)
-
-        if word == 0:
-            self.failed = True
-        self.audio_end = player.offset()
-        player.finish()
+            self.played = True
+        try:
+            piper.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            piper.kill()
+        return word
 
     def _show_failure(self):
         self.label.set_markup(
@@ -534,7 +554,7 @@ def main():
     signal.signal(signal.SIGTERM, on_sig)
     signal.signal(signal.SIGINT, on_sig)
 
-    win = Overlay(text, voices[vid], length_scale, args.pause, args.volume, tmpdir)
+    win = Overlay(text, voices, vid, length_scale, args.pause, args.volume, tmpdir)
     # Cover the primary monitor without calling fullscreen(): Mutter on
     # Wayland forces fullscreen surfaces opaque for direct-scanout, killing
     # our per-pixel alpha. Plain geometry keeps the surface compositable.
