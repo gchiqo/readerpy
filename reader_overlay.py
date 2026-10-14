@@ -10,21 +10,25 @@ Escape, q, space, or a mouse click.
 
 This script is normally spawned by read-aloud.py when 'reading_mode' is on
 in ~/.config/piper-read/config.json. Piper doesn't emit word-time alignment,
-so we synthesise the whole utterance first, then estimate per-word timings
-from each word's character length over the audio's actual duration.
+so each line is synthesised to its own WAV (one Piper process, --json-input),
+played as soon as it is ready, and its words' timings are estimated from
+their character lengths over that line's actual duration. Speaking starts
+after the first line, not after the whole selection.
 """
 
 import argparse
 import json
 import os
+import queue
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import threading
-import time
 import wave
+
+import piper_stream
 
 # Force the X11/XWayland backend BEFORE importing gi.
 # Reason: on Wayland, gtk_window_move() is a no-op (the compositor owns
@@ -39,9 +43,6 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk, GLib  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PIPER_DIR = os.path.join(HERE, "piper")
-PIPER_BIN = os.path.join(PIPER_DIR, "piper")
-ESPEAK_DATA = os.path.join(PIPER_DIR, "espeak-ng-data")
 VOICES_DIR = os.path.join(HERE, "voices")
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "piper-read")
 LOCK = os.path.join(CACHE_DIR, "play.pgid")
@@ -84,44 +85,6 @@ def pick_voice(voices, requested):
     return next(iter(voices)) if voices else None
 
 
-# ---- synthesis + playback helpers ----------------------------------------
-
-def synth_to_wav(text, voice_info, length_scale, sentence_silence):
-    out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-    env = dict(os.environ)
-    prev = env.get("LD_LIBRARY_PATH", "")
-    env["LD_LIBRARY_PATH"] = PIPER_DIR + (os.pathsep + prev if prev else "")
-    cmd = [PIPER_BIN, "-m", voice_info["model"], "-c", voice_info["config"],
-           "--espeak_data", ESPEAK_DATA, "-f", out, "-q",
-           "--length_scale", f"{length_scale}",
-           "--sentence_silence", f"{sentence_silence}"]
-    proc = subprocess.run(cmd, input=text.encode("utf-8"),
-                          env=env, stderr=subprocess.DEVNULL)
-    if proc.returncode != 0 or not os.path.exists(out):
-        try: os.unlink(out)
-        except OSError: pass
-        return None, 0.0
-    try:
-        with wave.open(out, "rb") as w:
-            dur = w.getnframes() / float(w.getframerate())
-    except (wave.Error, EOFError):
-        dur = 0.0
-    return out, dur
-
-
-def player_cmd(volume):
-    if shutil.which("pw-play"):
-        cmd = ["pw-play"]
-        if volume is not None:
-            cmd += ["--volume", f"{volume}"]
-        return cmd
-    if shutil.which("aplay"):
-        return ["aplay", "-q"]
-    if shutil.which("ffplay"):
-        return ["ffplay", "-hide_banner", "-loglevel", "quiet", "-nodisp", "-autoexit"]
-    return None
-
-
 # ---- word timing estimator -----------------------------------------------
 
 def word_timings(words, total_duration):
@@ -156,7 +119,7 @@ class Overlay(Gtk.Window):
     COLOR_CURRENT = "#ffd54f"
     FONT_BIG = "Sans 32"
 
-    def __init__(self, text, voice_info, length_scale, sentence_silence, volume):
+    def __init__(self, text, voice_info, length_scale, sentence_silence, volume, tmpdir):
         # Normal top-level window so Alt+Tab can find it. Undecorated because
         # we draw our own close button. set_keep_above is best-effort: works
         # on X11, may be ignored on Wayland (the WM controls stacking there).
@@ -270,16 +233,22 @@ class Overlay(Gtk.Window):
         self.add(self.olay)
 
         self.text = text
+        self.lines = [ln for ln in text.split("\n") if ln.strip()]
         self.words = text.split()
         self.voice_info = voice_info
         self.length_scale = length_scale
         self.sentence_silence = sentence_silence
         self.volume = volume
+        self.tmpdir = tmpdir
         self.current = -1
         self.player = None
-        self.wav_path = None
-        self.timings = []
-        self.start_time = None
+        self.piper = None
+        self.stopped = False
+        self.failed = False
+        # (start, end) per word in stream seconds; None until its line is
+        # synthesised. Filled by the feeder thread, read by _tick.
+        self.timings = [None] * len(self.words)
+        self.audio_end = None
         self._render(-1)
 
     # ---- rendering ----
@@ -382,13 +351,13 @@ class Overlay(Gtk.Window):
             pass
 
     def _cleanup(self):
+        self.stopped = True
         if self.player:
-            try: self.player.terminate()
+            self.player.kill()
+        if self.piper:
+            try: self.piper.terminate()
             except Exception: pass
-            self.player = None
-        if self.wav_path and os.path.exists(self.wav_path):
-            try: os.unlink(self.wav_path)
-            except OSError: pass
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
         try:
             with open(LOCK) as fh:
                 pgid = int(fh.read().strip())
@@ -399,45 +368,100 @@ class Overlay(Gtk.Window):
 
     # ---- synthesis & playback ----
     def start(self):
-        threading.Thread(target=self._synth_in_bg, daemon=True).start()
-
-    def _synth_in_bg(self):
-        wav, dur = synth_to_wav(self.text, self.voice_info,
-                                self.length_scale, self.sentence_silence)
-        GLib.idle_add(self._begin_playback, wav, dur)
-
-    def _begin_playback(self, wav, dur):
-        if not wav:
-            self.label.set_markup(
-                "<span font='Sans 22' foreground='#f88'>Synthesis failed.</span>")
-            return False
-        self.wav_path = wav
-        self.timings = word_timings(self.words, dur)
-        cmd = player_cmd(self.volume)
-        if cmd:
-            try:
-                self.player = subprocess.Popen(cmd + [wav])
-            except OSError:
-                self.player = None
-        self.start_time = time.monotonic()
+        try:
+            # Opened now so a Bluetooth sink wakes on the lead-in silence
+            # while Piper loads its model.
+            self.player = piper_stream.Player(self.voice_info["rate"], self.volume)
+        except (RuntimeError, OSError):
+            self._show_failure()
+            return
+        threading.Thread(target=self._synth_and_play, daemon=True).start()
         GLib.timeout_add(40, self._tick)
-        return False
+
+    def _synth_and_play(self):
+        """One Piper process writes each line to its own WAV and prints the
+        path when it is done. Each line is queued to the player as soon as it
+        arrives; while waiting on Piper, the player is padded with silence."""
+        player = self.player
+        paths = [os.path.join(self.tmpdir, f"{k:05d}.wav") for k in range(len(self.lines))]
+        self.piper = subprocess.Popen(
+            piper_stream.piper_cmd(self.voice_info, self.length_scale, self.sentence_silence,
+                                   "--json-input", "--output_dir", self.tmpdir),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, env=piper_stream.piper_env(),
+        )
+
+        def feed():
+            try:
+                for line, path in zip(self.lines, paths):
+                    self.piper.stdin.write(
+                        (json.dumps({"text": line, "output_file": path}) + "\n").encode("utf-8"))
+                self.piper.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+
+        done = queue.Queue()
+
+        def pull():
+            for _ in self.piper.stdout:  # Piper prints each finished path, in order
+                done.put(True)
+            done.put(False)
+
+        threading.Thread(target=feed, daemon=True).start()
+        threading.Thread(target=pull, daemon=True).start()
+
+        word = 0
+        for line, path in zip(self.lines, paths):
+            while True:
+                if self.stopped or player.dead:
+                    return
+                try:
+                    ok = done.get(timeout=0.02)
+                    break
+                except queue.Empty:
+                    player.keep_fed()
+            if not ok:
+                break  # Piper exited early
+            try:
+                with wave.open(path, "rb") as w:
+                    pcm = w.readframes(w.getnframes())
+                os.unlink(path)
+            except (OSError, wave.Error, EOFError):
+                pcm = b""
+            n = len(line.split())
+            start = player.offset()
+            dur = len(pcm) / float(player.bytes_per_sec)
+            for i, (s, e) in enumerate(word_timings(self.words[word:word + n], dur)):
+                self.timings[word + i] = (start + s, start + e)
+            word += n
+            player.write(pcm)
+
+        if word == 0:
+            self.failed = True
+        self.audio_end = player.offset()
+        player.finish()
+
+    def _show_failure(self):
+        self.label.set_markup(
+            "<span font='Sans 22' foreground='#f88'>Synthesis failed.</span>")
 
     def _tick(self):
-        if not self.timings or self.start_time is None:
+        if self.stopped:
             return False
-        elapsed = time.monotonic() - self.start_time
+        if self.failed:
+            self._show_failure()
+            return False
+        elapsed = self.player.position()
         idx = -1
-        for i, (s, _e) in enumerate(self.timings):
-            if elapsed >= s:
-                idx = i
-            else:
+        for i, t in enumerate(self.timings):
+            if t is None or elapsed < t[0]:
                 break
+            idx = i
         if idx != self.current:
             self.current = idx
             self._render(idx)
             self._maybe_autoscroll(idx)
-        if elapsed > self.timings[-1][1] + 0.4:
+        if self.audio_end is not None and elapsed > self.audio_end + 0.4:
             self._dismiss()
             return False
         return True
@@ -495,7 +519,10 @@ def main():
     except OSError:
         pass
 
+    tmpdir = tempfile.mkdtemp(prefix="overlay-", dir=CACHE_DIR)
+
     def on_sig(*_):
+        shutil.rmtree(tmpdir, ignore_errors=True)
         try:
             with open(LOCK) as fh:
                 pgid = int(fh.read().strip())
@@ -507,7 +534,7 @@ def main():
     signal.signal(signal.SIGTERM, on_sig)
     signal.signal(signal.SIGINT, on_sig)
 
-    win = Overlay(text, voices[vid], length_scale, args.pause, args.volume)
+    win = Overlay(text, voices[vid], length_scale, args.pause, args.volume, tmpdir)
     # Cover the primary monitor without calling fullscreen(): Mutter on
     # Wayland forces fullscreen surfaces opaque for direct-scanout, killing
     # our per-pixel alpha. Plain geometry keeps the surface compositable.

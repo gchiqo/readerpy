@@ -13,7 +13,7 @@ import subprocess
 
 import gi
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, GLib  # noqa: E402
+from gi.repository import Gio, Gtk, GLib  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 READER = os.path.join(HERE, "read-aloud.py")
@@ -54,6 +54,23 @@ def list_voices():
         return []
 
 
+def _interface_settings():
+    source = Gio.SettingsSchemaSource.get_default()
+    schema = source.lookup("org.gnome.desktop.interface", True) if source else None
+    return Gio.Settings.new("org.gnome.desktop.interface") if schema else None
+
+
+def system_prefers_dark(settings):
+    """GNOME's Appearance → Style setting (color-scheme), or a *-dark GTK
+    theme on older setups. GTK3 doesn't follow color-scheme on its own."""
+    if settings is None:
+        return False
+    keys = settings.props.settings_schema.list_keys()
+    if "color-scheme" in keys and settings.get_string("color-scheme") == "prefer-dark":
+        return True
+    return "gtk-theme" in keys and settings.get_string("gtk-theme").lower().endswith("-dark")
+
+
 def run_reader(*args):
     try:
         subprocess.Popen(["python3", READER, *args])
@@ -69,6 +86,13 @@ class Window(Gtk.ApplicationWindow):
         self.set_resizable(False)
         self.cfg = load_config()
         self._loading = True
+
+        # Follow the system light/dark style, live.
+        self._iface = _interface_settings()
+        self._apply_theme()
+        if self._iface is not None:
+            self._iface.connect("changed", lambda _s, key: key in ("color-scheme", "gtk-theme")
+                                and self._apply_theme())
 
         grid = Gtk.Grid(row_spacing=14, column_spacing=14)
         self.add(grid)
@@ -195,8 +219,15 @@ class Window(Gtk.ApplicationWindow):
         s.set_hexpand(True)
         return s
 
+    def _apply_theme(self):
+        self.dark = system_prefers_dark(self._iface)
+        Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", self.dark)
+
     def _flash(self, text, error=False):
-        color = "#c0392b" if error else "#2e7d32"
+        if self.dark:
+            color = "#ff7b6b" if error else "#7bd88f"
+        else:
+            color = "#c0392b" if error else "#2e7d32"
         self.status.set_markup(f"<small><span foreground='{color}'>{GLib.markup_escape_text(text)}</span></small>")
 
     # -- live status indicator --

@@ -18,17 +18,17 @@ getUserName / foo_bar become real words.
 import argparse
 import json
 import os
+import queue
 import re
-import shutil
 import signal
 import subprocess
 import sys
+import threading
 import unicodedata
 
+import piper_stream
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-PIPER_DIR = os.path.join(HERE, "piper")
-PIPER_BIN = os.path.join(PIPER_DIR, "piper")
-ESPEAK_DATA = os.path.join(PIPER_DIR, "espeak-ng-data")
 VOICES_DIR = os.path.join(HERE, "voices")
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "piper-read")
@@ -298,21 +298,6 @@ def stop_running():
 # Synthesis + streaming playback
 # ---------------------------------------------------------------------------
 
-def player_cmd(rate, volume=None):
-    if shutil.which("pw-play"):
-        cmd = ["pw-play", "--raw", "--format", "s16", "--rate", str(rate), "--channels", "1"]
-        if volume is not None:
-            cmd += ["--volume", f"{volume}"]
-        return cmd + ["-"]
-    if shutil.which("aplay"):
-        return ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-c", "1", "-r", str(rate), "-"]
-    if shutil.which("ffplay"):
-        vol = ["-volume", str(int(max(0.0, min(2.0, volume if volume is not None else 1.0)) * 100))]
-        return ["ffplay", "-hide_banner", "-loglevel", "quiet", "-nodisp", "-autoexit",
-                *vol, "-f", "s16le", "-ar", str(rate), "-ch_layout", "mono", "-i", "-"]
-    return None
-
-
 def speak(text, voice, length_scale, sentence_silence=0.2, volume=None):
     voices = discover_voices()
     vid = pick_voice(voices, voice)
@@ -320,8 +305,7 @@ def speak(text, voice, length_scale, sentence_silence=0.2, volume=None):
         sys.exit("no voices found in " + VOICES_DIR)
     info = voices[vid]
 
-    player = player_cmd(info["rate"], volume)
-    if not player:
+    if not piper_stream.player_cmd(info["rate"], volume):
         sys.exit("no audio player found (need pw-play, aplay or ffplay)")
 
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -337,28 +321,48 @@ def speak(text, voice, length_scale, sentence_silence=0.2, volume=None):
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGINT, cleanup)
 
-    env = dict(os.environ)
-    prev = env.get("LD_LIBRARY_PATH", "")
-    env["LD_LIBRARY_PATH"] = PIPER_DIR + (os.pathsep + prev if prev else "")
-
+    # Open the player first so a Bluetooth sink wakes on lead-in silence while
+    # Piper is still loading its model.
+    player = piper_stream.Player(info["rate"], volume)
     piper = subprocess.Popen(
-        [PIPER_BIN, "-m", info["model"], "-c", info["config"],
-         "--espeak_data", ESPEAK_DATA, "--output_raw", "-q",
-         "--length_scale", f"{length_scale}",
-         "--sentence_silence", f"{sentence_silence}"],
+        piper_stream.piper_cmd(info, length_scale, sentence_silence, "--output_raw"),
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, env=env,
+        stderr=subprocess.DEVNULL, env=piper_stream.piper_env(),
     )
-    play = subprocess.Popen(player, stdin=piper.stdout)
-    piper.stdout.close()  # let piper get SIGPIPE if the player goes away
 
-    try:
-        piper.stdin.write((text + "\n").encode("utf-8"))
-        piper.stdin.close()
-    except BrokenPipeError:
-        pass
+    def feed():
+        try:
+            piper.stdin.write((text + "\n").encode("utf-8"))
+            piper.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
 
-    play.wait()
+    chunks = queue.Queue()
+
+    def pull():
+        while True:
+            data = os.read(piper.stdout.fileno(), 8192)
+            chunks.put(data or None)
+            if not data:
+                return
+
+    threading.Thread(target=feed, daemon=True).start()
+    threading.Thread(target=pull, daemon=True).start()
+
+    odd = b""  # a pipe read can split a sample across two chunks
+    while not player.dead:
+        try:
+            data = chunks.get(timeout=0.02)
+        except queue.Empty:
+            player.keep_fed()  # Piper is between sentences: pause, don't glitch
+            continue
+        if data is None:
+            break
+        data = odd + data
+        odd, data = (data[-1:], data[:-1]) if len(data) % 2 else (b"", data)
+        player.write(data)
+
+    player.finish()
     try:
         piper.wait(timeout=2)
     except subprocess.TimeoutExpired:
